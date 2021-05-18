@@ -20,6 +20,12 @@ class CRM_Civiquickbooks_Invoice {
 
   protected $contribution_status_by_value;
 
+  /**
+   * Stores accounting codes for accounts related to a financial type
+   */
+  private $acctgCodeCache = array();
+
+
   public function __construct() {
     $this->contribution_status = civicrm_api3('Contribution', 'getoptions', array('field' => 'contribution_status_id'));
 
@@ -204,9 +210,13 @@ class CRM_Civiquickbooks_Invoice {
         'group' => 'QuickBooks Online Settings',
     ));
 
+    $do_add_fee_lines = civicrm_api3('Setting', 'getvalue', array(
+        'name' => "quickbooks_add_fee_lines",
+        'group' => 'QuickBooks Online Settings',
+    ));
+
     foreach($payments['values'] as $payment) {
       $txnDate = $payment['trxn_date'];
-      $total = sprintf('%.5f', $payment['total_amount']);
       $txnRefNum = $payment['trxn_id'];
 
       // check for an existing payment with this payment ref num
@@ -219,6 +229,15 @@ class CRM_Civiquickbooks_Invoice {
 
         // skip rest of loop
         continue;
+      }
+
+      // This might need to be a separate setting, but, if we deduct fees
+      // from our invoice, we probably also want to only record the net
+      // amount as payment.
+      if ($do_add_fee_lines) {
+        $total = sprintf('%.5f', $payment['net_amount']);
+      } else {
+        $total = sprintf('%.5f', $payment['total_amount']);
       }
 
       $privateNote = [];
@@ -449,6 +468,9 @@ class CRM_Civiquickbooks_Invoice {
         'contribution_status_id',
         'receive_date',
         'contribution_source',
+        'total_amount',
+        'fee_amount',
+        'net_amount'
       ),
       'id' => $contributionID,
     ));
@@ -476,8 +498,7 @@ class CRM_Civiquickbooks_Invoice {
       }
     }
     else {
-      $accountsInvoice = $this->mapToAccounts($db_contribution, $accountsInvoiceID, $SyncToken, $qb_id);
-      return $accountsInvoice;
+      return $this->mapToAccounts($db_contribution, $accountsInvoiceID, $SyncToken, $qb_id);
     }
   }
 
@@ -508,6 +529,11 @@ class CRM_Civiquickbooks_Invoice {
     $contributionID = $db_contribution['id'];
 
     if (in_array($contri_status_in_lower, $status_array)) {
+    $do_add_fee_lines = civicrm_api3('Setting', 'getvalue', array(
+        'name' => "quickbooks_add_fee_lines",
+        'group' => 'QuickBooks Online Settings',
+    ));
+
     $class_delimiter = civicrm_api3('Setting', 'getvalue', array(
       'name' => "quickbooks_class_delimiter",
       'group' => 'QuickBooks Online Settings',
@@ -538,52 +564,56 @@ class CRM_Civiquickbooks_Invoice {
 
       $tax_codes = array();
 
+
+      // For now, assuming the first line item's fee account applies to total balacnce.
+      // If anyone wants to use different fee accounts per financial type,
+      // then this can be changed and the fee prorated by total.
+      $first_financial_type_id = NULL;
+      $fee_acctg_code = NULL;
+
+      $next_id = NULL;
       //Collect all accounting codes for all line items
       foreach ($db_line_items['values'] as $id => $line_item) {
-        //get Inc Account accounting code if it is not collected previously
-        if (!isset($item_ref_codes[$line_item['financial_type_id']])) {
-          $tmp = htmlspecialchars_decode(CRM_Financial_BAO_FinancialAccount::getAccountingCode($line_item['financial_type_id']));
+        $next_id = $id + 1;
+        $financial_type_id = $line_item['financial_type_id'];
 
-          $item_ref_codes[$line_item['financial_type_id']] = $tmp;
+        //get Inc Account accounting code if it is not collected previously
+        if (!isset($item_ref_codes[$financial_type_id])) {
+          $tmp = htmlspecialchars_decode(CRM_Financial_BAO_FinancialAccount::getAccountingCode($financial_type_id));
+
+          $item_ref_codes[$financial_type_id] = $tmp;
           $item_codes[] = $tmp;
         }
 
-        $db_line_items['values'][$id]['acctgCode'] = $item_ref_codes[$line_item['financial_type_id']];
+        $db_line_items['values'][$id]['acctgCode'] = $item_ref_codes[$financial_type_id];
 
         //get Sales Tax Account accounting code if it is not collected previously
-        if (!isset($tax_types[$line_item['financial_type_id']])) {
-          try {
-            $result = civicrm_api3('EntityFinancialAccount', 'getsingle', array(
-              'sequential' => 1,
-              'return' => array("financial_account_id"),
-              'entity_id' => $line_item['financial_type_id'],
-              'entity_table' => "civicrm_financial_type",
-              'account_relationship' => "Sales Tax Account is",
-            ));
+        if (!isset($tax_types[$financial_type_id])) {
+          // We will use account type code to get state tax code id for US companies
+          $tax_types[$financial_type_id] = array(
+            'sale_tax_acctgCode' => $this->getAcctgCodeForFinancialType($financial_type_id, "Sales Tax"),
+            'sale_tax_account_type_code' => $this->getAccTypeCodeForFinancialType($financial_type_id, "Sales Tax"),
+          );
 
-            $result = civicrm_api3('FinancialAccount', 'getsingle', array(
-              'sequential' => 1,
-              'id' => $result['financial_account_id'],
-            ));
-
-            $tmp = htmlspecialchars_decode($result['accounting_code']);
-
-            // We will use account type code to get state tax code id for US companies
-            $tax_types[$line_item['financial_type_id']] = array(
-              'sale_tax_acctgCode' => $tmp,
-              'sale_tax_account_type_code' => htmlspecialchars_decode($result['account_type_code']),
-            );
-
-            $tax_codes[] = $tmp;
-          } catch (CiviCRM_API3_Exception $e) {
-
-          }
+          $tax_codes[] = $tmp;
         }
 
-        $db_line_items['values'][$id]['sale_tax_acctgCode'] = $tax_types[$line_item['financial_type_id']]['sale_tax_acctgCode'];
+        //get Fee Account accounting code if it is not collected previously
+        if (is_null($fee_acctg_code)) {
+          $first_financial_type_id = $financial_type_id;
+          $fee_acctg_code = $this->getAcctgCodeForFinancialType($financial_type_id, "Expense");
+        }
+      } // end of loop collecting accounting codes for each line item
 
-        // We will use account type code to get state tax code id for US companies
-        $db_line_items['values'][$id]['sale_tax_account_type_code'] = $tax_types[$line_item['financial_type_id']]['sale_tax_account_type_code'];
+      // Add another line item to invoice to reflect payment processing fees, if option selected
+      $fee_value = $db_contribution['fee_amount'];
+      if ($do_add_fee_lines and $fee_value != 0) {
+        $db_line_items['values'][$next_id]  = [
+          "qty" => (-1) * $fee_value,
+          "unit_price" => 1,
+          "line_total" => (-1) * $fee_value,
+          "acctgCode" => $fee_acctg_code,
+        ];
       }
 
       $i = 1;
@@ -598,8 +628,8 @@ class CRM_Civiquickbooks_Invoice {
       foreach ($db_line_items['values'] as $id => $line_item) {
         $line_item_description = str_replace(array('&nbsp;'), ' ', $line_item['label']);
         $acctg_code = $line_item['acctgCode'];
-        $class_code = Null;
-        $class_ref = Null;
+        $class_code = NULL;
+        $class_ref = NULL;
 
         if (strlen($class_delimiter) > 0 && strpos($acctg_code, $class_delimiter) !== false) {
           list($acctg_code, $class_code) = explode($class_delimiter, $acctg_code);
@@ -607,7 +637,7 @@ class CRM_Civiquickbooks_Invoice {
 
         try {
           $item_ref = self::getItem($acctg_code);
-          if ($class_code != Null) {
+          if ($class_code != NULL) {
               $class_ref = self::getQBOClass($class_code);
           }
         } catch (Exception $e) {
@@ -653,13 +683,14 @@ class CRM_Civiquickbooks_Invoice {
             ),
             'UnitPrice' => $lineTotal / $line_item['qty'] * 1.00,
             'Qty' => $line_item['qty'] * 1,
-            'TaxCodeRef' => array(
-              'value' => $line_item_tax_ref,
-            ),
           ),
         );
 
-        if ($class_ref != Null) {
+        if ($line_item_tax_ref != NULL) {
+            $tmp['TaxCodeRef'] = array('value' => $line_item_tax_ref);
+        }
+
+        if ($class_ref != NULL) {
             $tmp['SalesItemLineDetail']['ClassRef'] = ["value" => $class_ref];
         }
 
@@ -703,6 +734,10 @@ class CRM_Civiquickbooks_Invoice {
       if (empty($line_items)) {
         throw new CiviCRM_API3_Exception("No valid line items in the Invoice to push:\n" . $QBO_errormsg, 'qbo_invoice_line_items');
       }
+
+
+      $customerMemo = [];
+      $customerMemo[] = $db_contribution['contribution_source'];
 
       $new_invoice += array(
         'TxnDate' => $receive_date,
@@ -809,6 +844,60 @@ class CRM_Civiquickbooks_Invoice {
         );
       }
     }
+  }
+
+
+  /**
+   *
+   */
+  public function determineAcctgCodeAccountTypeForFinancialType($financial_type_id, $account_type) {
+    $account_relationship = "$account_type Account is";
+
+    $efaParams = array(
+      'entity_id' => $financial_type_id,
+      'entity_table' => "civicrm_financial_type",
+      'account_relationship' => $account_relationship,
+      'sequential' => 1,
+      'return' => array("financial_account_id"),
+    );
+
+    $result = civicrm_api3('EntityFinancialAccount', 'get', $efaParams);
+
+    if ($result['count'] == 0) {
+      return [null, null];
+    }
+
+    $result = civicrm_api3('FinancialAccount', 'getsingle', array(
+      'sequential' => 1,
+      'id' => $result['values'][0]['financial_account_id'],
+    ));
+
+    $acctg_code = htmlspecialchars_decode($result['accounting_code']);
+    $acc_type_code = htmlspecialchars_decode($result['account_type_code']);
+
+    return [$acctg_code, $acc_type_code];
+  }
+
+  public function cacheAcctCodes($financial_type_id, $accountType) {
+    if (!array_key_exists($accountType, $this->acctgCodeCache)) {
+      $this->acctgCodeCache[$accountType] = array();
+    }
+    if (!array_key_exists($financial_type_id, $this->acctgCodeCache[$accountType])) {
+      [$acctg_code, $acc_type_code] = $this->determineAcctgCodeAccountTypeForFinancialType($financial_type_id, $accountType);
+      $this->acctgCodeCache[$accountType][$financial_type_id] = array(
+        'acctg_code' => $acctg_code, 'acc_type_code' => $acc_type_code
+      );
+    }
+  }
+
+  public function getAcctgCodeForFinancialType($financial_type_id, $accountType) {
+    $this->cacheAcctCodes($financial_type_id, $accountType);
+    return $this->acctgCodeCache[$accountType][$financial_type_id]["acctg_code"];
+  }
+
+  public function getAccTypeCodeForFinancialType($financial_type_id, $accountType) {
+    $this->cacheAcctCodes($financial_type_id, $accountType);
+    return $this->acctgCodeCache[$accountType][$financial_type_id]["acc_type_code"];
   }
 
   /**
