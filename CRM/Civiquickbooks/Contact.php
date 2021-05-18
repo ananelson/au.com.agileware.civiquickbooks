@@ -33,6 +33,7 @@ class CRM_Civiquickbooks_Contact {
           'contact_id',
           'contact_id.last_name',
           'contact_id.first_name',
+          'contact_id.email',
           'contact_id.organization_name',
           'contact_id.household_name',
           'contact_id.contact_type',
@@ -42,7 +43,8 @@ class CRM_Civiquickbooks_Contact {
       foreach($ac_list as $id => $ac) {
         switch($ac['contact_id.contact_type']) {
           case 'Individual':
-            $contact = $this->getQBOContactByName($ac['contact_id.last_name'], $ac['contact_id.first_name']);
+            $contact = $this->getQBOContactByNameAndEmail(
+              $ac['contact_id.last_name'], $ac['contact_id.first_name'], $ac['contact_id.email']);
             break;
           case 'Organization':
             $contact = $this->getQBOContactByName($ac['contact_id.organization_name']);
@@ -454,7 +456,7 @@ class CRM_Civiquickbooks_Contact {
       "Suffix"             => $contact['individual_suffix'],
       "FullyQualifiedName" => $contact['display_name'],
       "CompanyName"        => $contact['organization_name'],
-      "DisplayName"        => $contact['display_name'],
+      "DisplayName"        => "{$contact['first_name']} {$contact['last_name']} ({$contact['email']})",
       "PrimaryPhone"       => array(
         "FreeFormNumber" => self::getBillingPhone($contact),
       ),
@@ -518,6 +520,34 @@ class CRM_Civiquickbooks_Contact {
     return $customers;
   }
 
+  protected function getQBOContactByNameAndEmail($familyName, $givenName, $email) {
+    $displayName = "$givenName $familyName ($email)";
+
+    $query = "SELECT * FROM Customer WHERE DisplayName = \'$displayName\'";
+    return $this->queryCustomer($query);
+  }
+
+  protected function queryCustomer($query) {
+    try {
+      $dataService = CRM_Quickbooks_APIHelper::getAccountingDataServiceObject();
+
+      $dataService->throwExceptionOnError(FALSE);
+
+      $customers = $dataService->Query($query, 0, 1);
+      if ($last_error = $dataService->getLastError()) {
+        $error_message = CRM_Quickbooks_APIHelper::parseErrorResponse($last_error);
+
+        throw new Exception('"' . implode("\n", $error_message) . '"');
+      }
+
+      return current($customers) ?: NULL;
+    }
+    //process and analyse the response result from Quickbooks
+    catch(Exception $e) {
+      throw new CRM_Civiquickbooks_Contact_Exception('Error pulling single Customer from QBO: ' . $e->getMessage(), 0);
+    }
+  }
+
   /**
    * Get a single customer from Quickbooks Online by name.
    *
@@ -537,25 +567,7 @@ class CRM_Civiquickbooks_Contact {
       ? sprintf('SELECT * FROM Customer WHERE FullyQualifiedName = \'%s\'', $name)
       : sprintf('SELECT * FROM Customer WHERE FamilyName = \'%s\' AND GivenName = \'%s\'', $name, $givenName)
     );
-
-    try {
-      $dataService = CRM_Quickbooks_APIHelper::getAccountingDataServiceObject();
-
-      $dataService->throwExceptionOnError(FALSE);
-
-      $customers = $dataService->Query($query, 0, 1);
-      if ($last_error = $dataService->getLastError()) {
-        $error_message = CRM_Quickbooks_APIHelper::parseErrorResponse($last_error);
-
-        throw new Exception('"' . implode("\n", $error_message) . '"');
-      }
-
-      return current($customers) ?: NULL;
-    }
-    //process and analyse the response result from Quickbooks
-    catch(Exception $e) {
-      throw new CRM_Civiquickbooks_Contact_Exception('Error pulling single Customer from QBO: ' . $e->getMessage(), 0);
-    }
+    return $this->queryCustomer($query);
   }
 
 
