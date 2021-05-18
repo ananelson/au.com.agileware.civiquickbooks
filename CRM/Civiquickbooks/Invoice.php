@@ -73,7 +73,7 @@ class CRM_Civiquickbooks_Invoice {
 
       foreach ($records['values'] as $i => $record) {
         try {
-          $accountsInvoice = $this->getAccountsInvoice($record);
+          [$accountsInvoice, $accountsRefundCredit] = $this->getInvoiceInQuickbooksFormat($record);
 
           if(empty($accountsInvoice)) {
               civicrm_api3('AccountInvoice', 'create', ['id' => $record['id'], 'accounts_needs_update' => 0]);
@@ -109,7 +109,7 @@ class CRM_Civiquickbooks_Invoice {
 
             if ($result->Id) {
               $this->savePushResponse($result, $record);
-              $result_payments = self::pushPayments($record['contribution_id'], $result);
+              $result_payments = self::pushPayments($record['contribution_id'], $result, $accountsRefundCredit);
               self::sendEmail($result->Id);
             }
           }
@@ -195,8 +195,11 @@ class CRM_Civiquickbooks_Invoice {
    * @throws \QuickBooksOnline\API\Exception\SdkException
    * @throws \QuickBooksOnline\API\Exception\IdsException
    */
-  public static function pushPayments($contribution_id, $account_invoice) {
-    $payments = civicrm_api3('Payment', 'get', ['contribution_id' => $contribution_id, 'status_id' => 'Completed', 'sequential' => 1]);
+  public static function pushPayments($contribution_id, $account_invoice, $refund_credit) {
+    $payments = civicrm_api3('Payment', 'get', [
+        'contribution_id' => $contribution_id,
+        'status_id' => ['IN' => ["Completed", "Refunded"]],
+        'sequential' => 1]);
 
     if (!$payments['count']) {
       return;
@@ -283,12 +286,20 @@ class CRM_Civiquickbooks_Invoice {
       $QBOPayment = \QuickBooksOnline\API\Facades\Payment::create($QBOPaymentInfo);
 
       // If a payment, post the payment, linked to the previously posted invoice.
+      // If a refund, now post the RefundReceipt including payment info.
       if ($payment['status_id'] == 1) {
         $paymentResult = $dataService->Add($QBOPayment);
         $result[] = $paymentResult;
+      } else if ($payment['status_id'] == 7) {
+        if ($refund_credit != null) {
+          $refund_credit['DepositToAccountRef'] = $QBOAccount;
+          $refundReceipt = \QuickBooksOnline\API\Facades\RefundReceipt::create($refund_credit);
+          $result = $dataService->Add($refundReceipt);
+        }
       } else {
-          throw new Exception("unexpected status id for payment {$payment['status_id']}");
+        throw new Exception("unexpected status id for payment {$payment['status_id']}");
       }
+
     }
 
     return $result;
@@ -456,7 +467,7 @@ class CRM_Civiquickbooks_Invoice {
    * @return array
    * @throws \CiviCRM_API3_Exception
    */
-  protected function getAccountsInvoice($record) {
+  protected function getInvoiceInQuickbooksFormat($record) {
     $accountsInvoiceID = isset($record['accounts_invoice_id']) ? $record['accounts_invoice_id'] : NULL;
 
     $SyncToken = isset($record['accounts_data']) ? $record['accounts_data'] : NULL;
@@ -464,8 +475,8 @@ class CRM_Civiquickbooks_Invoice {
     $contributionID = $record['contribution_id'];
 
     $db_contribution = civicrm_api3('Contribution', 'getsingle', array(
-      'return' => array(
-        'contribution_status_id',
+        'return' => array(
+        'contribution_status',
         'receive_date',
         'contribution_source',
         'total_amount',
@@ -475,9 +486,7 @@ class CRM_Civiquickbooks_Invoice {
       'id' => $contributionID,
     ));
 
-    $db_contribution['status'] = $this->contribution_status[$db_contribution['contribution_status_id']];
-
-    $cancelledStatuses = array('failed', 'cancelled');
+    $cancelledStatuses = array('Failed', 'Cancelled');
 
     $qb_account = civicrm_api3('account_contact', 'getsingle', array(
       'contact_id' => $db_contribution['contact_id'],
@@ -487,7 +496,11 @@ class CRM_Civiquickbooks_Invoice {
 
     $qb_id = $qb_account['accounts_contact_id'];
 
-    if (in_array(strtolower($db_contribution['status']), $cancelledStatuses)) {
+    if (is_null($qb_id)) {
+      throw new Exception("no contact found for {$db_contribution['contact_id']}");
+    }
+
+    if (in_array(strtolower($db_contribution['contribution_status']), $cancelledStatuses)) {
       //according to the revised task description, we are not going to synch cancelled or failed contributions that are just created and not synched before.
       if (isset($accountsInvoiceID) && isset($SyncToken)) {
         $accountsInvoice = $this->mapCancelled($accountsInvoiceID, $SyncToken);
@@ -521,14 +534,23 @@ class CRM_Civiquickbooks_Invoice {
   protected function mapToAccounts($db_contribution, $accountsID, $SyncToken, $qb_id) {
     static $tmp = NULL;
     $new_invoice = array();
-    $contri_status_in_lower = strtolower($db_contribution['status']);
-
-    //those contributions we care
-    $status_array = array('pending', 'completed', 'partially paid');
+    $new_credit = array(); // if needed
 
     $contributionID = $db_contribution['id'];
 
-    if (in_array($contri_status_in_lower, $status_array)) {
+    $refund_date = null;
+    if ($db_contribution['contribution_status'] == "Refunded") {
+      // look up refund date from payments
+      $refunds = civicrm_api3('Payment', 'get', [
+          'contribution_id' => $contributionID,
+          'status_id' => "Refunded",
+          'sequential' => 1]);
+      foreach($refunds['values'] as $refund) {
+          $refund_date = $refund['trxn_date'];
+          break;
+      }
+    }
+
     $do_add_fee_lines = civicrm_api3('Setting', 'getvalue', array(
         'name' => "quickbooks_add_fee_lines",
         'group' => 'QuickBooks Online Settings',
@@ -538,6 +560,13 @@ class CRM_Civiquickbooks_Invoice {
       'name' => "quickbooks_class_delimiter",
       'group' => 'QuickBooks Online Settings',
     ));
+
+
+    // All supported statuses are listed here,
+    // user specifies which statuses they want to sync in preferences.
+    $supported_statuses = array('Pending', 'Completed', 'Partially Paid', 'Refunded');
+    if (in_array($db_contribution['contribution_status'], $supported_statuses)) {
+      // Assemble line items for contribution
       $db_line_items = civicrm_api3('LineItem', 'get', array(
         'contribution_id' => $contributionID,
       ));
@@ -743,7 +772,20 @@ class CRM_Civiquickbooks_Invoice {
         'TxnDate' => $receive_date,
         'DueDate' => $due_date,
         'CustomerMemo' => array(
-          'value' => $db_contribution['contribution_source'],
+          'value' => implode("\n", $customerMemo)
+        ),
+        'Line' => $line_items,
+        'CustomerRef' => array(
+          'value' => $qb_id,
+        ),
+        'GlobalTaxCalculation' => 'TaxExcluded',
+      );
+
+      $new_credit += array(
+        'TxnDate' => $refund_date,
+        'DueDate' => $refund_date,
+        'CustomerMemo' => array(
+          'value' => implode("\n", $customerMemo)
         ),
         'Line' => $line_items,
         'CustomerRef' => array(
@@ -769,9 +811,11 @@ class CRM_Civiquickbooks_Invoice {
 
       if ($whereToGetInvoiceNumber == 'civi') {
         $new_invoice['DocNumber'] = $invoice_prefix . sprintf("%07d", $db_contribution['id']);
+        $new_credit['DocNumber'] = $invoice_prefix . sprintf("%07d", $db_contribution['id']) . '-R';
       }
       elseif ($whereToGetInvoiceNumber == 'qb') {
         $new_invoice['AutoDocNumber'] = 1;
+        $new_credit['AutoDocNumber'] = 1;
       }
 
       // Check online credit card and ach payment settings
@@ -810,6 +854,7 @@ class CRM_Civiquickbooks_Invoice {
       }
       if ($customMemo != '') {
         $new_invoice['CustomerMemo'] = ['value' => $customMemo];
+        $new_credit['CustomerMemo'] = ['value' => $customMemo];
       }
 
       // For US company, add the array generated by $this->generateTxnTaxDetail on the top of the new invoice array.
@@ -822,6 +867,7 @@ class CRM_Civiquickbooks_Invoice {
 
           if (is_array($result)) {
             $new_invoice['TxnTaxDetail'] = $result;
+            $new_credit['TxnTaxDetail'] = $result;
           }
         }
         catch (\QuickbooksOnline\API\Exception\IdsException $e) {
@@ -835,7 +881,8 @@ class CRM_Civiquickbooks_Invoice {
       });
 
       try {
-        return \QuickBooksOnline\API\Facades\Invoice::create($new_invoice);
+        $accountsInvoice = \QuickBooksOnline\API\Facades\Invoice::create($new_invoice);
+        return [$accountsInvoice, $new_credit];
       }
       catch(Exception $e) {
         throw new CiviCRM_API3_Exception(
