@@ -597,7 +597,7 @@ class CRM_Civiquickbooks_Invoice {
           'DetailType' => 'SalesItemLineDetail',
           'SalesItemLineDetail' => array(
             'ItemRef' => array(
-              'value' => $line_item_ref,
+              'value' => $item_ref,
             ),
             'UnitPrice' => $lineTotal / $line_item['qty'] * 1.00,
             'Qty' => $line_item['qty'] * 1,
