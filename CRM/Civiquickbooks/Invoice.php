@@ -199,25 +199,77 @@ class CRM_Civiquickbooks_Invoice {
     $dataService = CRM_Quickbooks_APIHelper::getAccountingDataServiceObject();
     $result = [];
 
+    $use_deposit_accounts = civicrm_api3('Setting', 'getvalue', array(
+        'name' => "quickbooks_use_deposit_accounts",
+        'group' => 'QuickBooks Online Settings',
+    ));
+
     foreach($payments['values'] as $payment) {
       $txnDate = $payment['trxn_date'];
       $total = sprintf('%.5f', $payment['total_amount']);
-      $QBOPayment = \QuickBooksOnline\API\Facades\Payment::create(
-        [
-          'TotalAmt' => $total,
-          'CustomerRef' => $account_invoice->CustomerRef,
-          'CurrencyRef' => $account_invoice->CurrencyRef,
-          'TxnDate' => $txnDate,
-          'Line' => [
+      $txnRefNum = $payment['trxn_id'];
+
+      // check for an existing payment with this payment ref num
+      // TODO safer way to do this query? <- what does this mean?
+      $existingPayments = $dataService->Query("SELECT * from Payments WHERE PaymentRefNum = " . $txnRefNum);
+
+      if (!empty($existingPayments)) {
+        // link existing payments to contribution
+        throw new Exception("existing payment found for " . $txnRefNum);
+
+        // skip rest of loop
+        continue;
+      }
+
+      $privateNote = [];
+
+      $QBOPaymentInfo = [
+        'TotalAmt' => $total,
+        'CustomerRef' => $account_invoice->CustomerRef,
+        'CurrencyRef' => $account_invoice->CurrencyRef,
+        'TxnDate' => $txnDate,
+        'Line' => [
+          [
             'Amount' => $total,
-            'LinkedTxn' => [[
+            'LinkedTxn' => [
               'TxnType' => 'Invoice',
-              'TxnId' => $account_invoice->Id,
-            ]],
+              'TxnId' => $account_invoice->Id
+            ],
           ],
-        ]
-      );
-      $result[] = $dataService->Add($QBOPayment);
+        ],
+      ];
+
+      if (strlen($payment['trxn_id']) <= 21) {
+        $QBOPaymentInfo['PaymentRefNum'] = $payment['trxn_id'];
+      } else {
+        $QBOPaymentInfo['PaymentRefNum'] = substr($payment['trxn_id'], -10) . " (" . $contribution_id . ")";
+      }
+      if (strlen($payment['trxn_id']) > 0) {
+        $privateNote[] = "Trxn ID: {$payment['trxn_id']}";
+      }
+      $privateNote[] = "Received at {$payment['trxn_date']}";
+      $privateNote[] = "In Payment For Contribution $contribution_id";
+
+      if ($use_deposit_accounts) {
+        $financial_account_for_payment = civicrm_api3("FinancialAccount", "getsingle", ['id' => $payment['to_financial_account_id']]);
+        $qboAccountNumber = $financial_account_for_payment['accounting_code'];
+        $QBOAccount = self::getAccount($qboAccountNumber);
+
+        $QBOPaymentInfo['DepositToAccountRef'] = [
+          'value' => $QBOAccount
+        ];
+      }
+
+      $QBOPaymentInfo['PrivateNote'] = implode("\n", $privateNote);
+      $QBOPayment = \QuickBooksOnline\API\Facades\Payment::create($QBOPaymentInfo);
+
+      // If a payment, post the payment, linked to the previously posted invoice.
+      if ($payment['status_id'] == 1) {
+        $paymentResult = $dataService->Add($QBOPayment);
+        $result[] = $paymentResult;
+      } else {
+          throw new Exception("unexpected status id for payment {$payment['status_id']}");
+      }
     }
 
     return $result;
@@ -818,6 +870,66 @@ class CRM_Civiquickbooks_Invoice {
 
     return $items[$name];
   }
+
+  /**
+   * Get account id from QBO by Name or FullyQualifiedName
+   *
+   * @param $name - Name or FullyQualifiedName of Account.
+   *                Assumes FullyQualifiedName if containing a colon (:)
+   *
+   * @return int|FALSE
+   * @throws \CiviCRM_API3_Exception
+   * @throws \QuickBooksOnline\API\Exception\SdkException
+   */
+  public static function getAccount($name) {
+    $items =& \Civi::$statics[__CLASS__][__FUNCTION__];
+
+    if(!isset($items[$name])) {
+      $field = (strpos($name, ':') === FALSE) ? 'Name' : 'FullyQualifiedName';
+      $query = sprintf('SELECT %1$s,Id From Account WHERE %1$s = \'%2$s\'', $field, $name);
+
+      $dataService= CRM_Quickbooks_APIHelper::getAccountingDataServiceObject();
+      $result = $dataService->Query($query,0,1);
+
+      if(empty($result)) {
+        throw new Exception("No Account found matching Name $name");
+      }
+
+      $items[$name] = $result[0]->Id;
+    }
+
+    return $items[$name];
+  }
+
+  /**
+   * Get account id from QBO by Number (Chart of Accounts reference number)
+   *
+   * @param $number - Number of Account
+   *
+   * @return int|FALSE
+   * @throws \CiviCRM_API3_Exception
+   * @throws \QuickBooksOnline\API\Exception\SdkException
+   */
+  public static function getAccountByNumber($number) {
+    $items =& \Civi::$statics[__CLASS__][__FUNCTION__];
+
+    if(!isset($items[$number])) {
+      $field = "AcctNum";
+      $query = sprintf('SELECT %1$s,Id From Account WHERE %1$s = \'%2$s\'', $field, $number);
+
+      $dataService= CRM_Quickbooks_APIHelper::getAccountingDataServiceObject();
+      $result = $dataService->Query($query,0,1);
+
+      if(empty($result)) {
+        throw new Exception("No Account found matching Number $number");
+      }
+
+      $items[$number] = $result[0]->Id;
+    }
+
+    return $items[$number];
+  }
+
   /**
    * Get TaxCode id from QBO by Namde
    *
